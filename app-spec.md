@@ -10,8 +10,8 @@ Build a test/demo application with this architecture:
 * OpenTelemetry instrumentation in the FastAPI app
 * OpenTelemetry Collector
 * ClickHouse as the telemetry backend
-* another service that lets me query from click house and show it on my UI, i have already built the UI, i want a fastapi app to make build the APIs for populating the UI, all metrics   
-  must be queried based on the username, add some test cases for this API interface as well                     
+* A uiapi based service that will be used by the UI app to get telemetry data from click house. The telemetry data can be filtered based on the username.(accessible via an ingress)
+* A simple UI service based on react.js running on nginx pod that serves the UI(accessible via an ingress)                    
 
 The FastAPI app must expose simple test endpoints. When those endpoints are hit, telemetry must be emitted and ultimately stored in ClickHouse.
 
@@ -310,7 +310,7 @@ The implementation should be robust enough for automated execution:
 
 Consider the task complete only when all of the following are true:
 
-1. FastAPI app is implemented.
+1. FastAPI app/ ui-api app and UI app is implemented.
 2. OTel instrumentation is implemented.
 3. Collector is configured.
 4. ClickHouse is deployed and receiving telemetry.
