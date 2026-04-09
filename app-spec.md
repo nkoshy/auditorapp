@@ -10,6 +10,8 @@ Build a test/demo application with this architecture:
 * OpenTelemetry instrumentation in the FastAPI app
 * OpenTelemetry Collector
 * ClickHouse as the telemetry backend
+* another service that lets me query from click house and show it on my UI, i have already built the UI, i want a fastapi app to make build the APIs for populating the UI, all metrics   
+  must be queried based on the username, add some test cases for this API interface as well                     
 
 The FastAPI app must expose simple test endpoints. When those endpoints are hit, telemetry must be emitted and ultimately stored in ClickHouse.
 
