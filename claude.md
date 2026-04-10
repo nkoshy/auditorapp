@@ -36,7 +36,7 @@ Use these commands as the default workflow:
   <appname>.68.220.202.177.nip.io
 - use annotations to get certificates from letencrypt - Cluster Issuer is already deployed- letsencrypt-prod
 - reuse the ingress (do not delete and recreate for the same hostname unless needed as it can cause rate-limit with letsencrypt)
-- use the container image registry registry.68.220.202.177.nip.io to push the code to after building the image using kaniko on k8s itself in automationx namespace - this registry does not require any credentials.
+- use the container image registry registry.68.220.202.177.nip.io to push the code to after building the image using kaniko on k8s itself in automationx namespace - this registry does not require any credentials. Use batch/v1 Kind: Job with ttlSecondsAfterFinished: 300 for all kaniko builds. Never use Deployments for one-time build tasks.
 
 ## Test commands
 Primary test command:
