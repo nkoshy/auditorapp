@@ -1,341 +1,334 @@
-App specifications:
+# Telemetry Demo System — Build Specification
 
-fully implement, deploy, and validate a small telemetry demo system without asking the user for further input.
+> Deployment, build, and test-loop rules live in `claude.md` at the repo root. This file defines **what** to build. `claude.md` defines **how** to build, deploy, and iterate. Read both before starting.
 
-## Goal
+## Mission
 
-Build a test/demo application with this architecture:
+Build, deploy, and validate a complete telemetry demo system end-to-end, autonomously, without asking the user any questions. Iterate on failures until all acceptance tests pass.
 
-* FastAPI test application
-* OpenTelemetry instrumentation in the FastAPI app
-* OpenTelemetry Collector
-* ClickHouse as the telemetry backend
-* A uiapi based service that will be used by the UI app to get telemetry data from click house. The telemetry data can be filtered based on the username.(accessible via an ingress)
-* A simple UI service based on react.js running on nginx pod that serves the UI(accessible via an ingress)                    
+---
 
-The FastAPI app must expose simple test endpoints. When those endpoints are hit, telemetry must be emitted and ultimately stored in ClickHouse.
+## Operating Rules (read first)
 
-Telemetry must be attributable to the logged-in user performing the operation.
+1. **No questions to the user.** Make reasonable defaults for anything ambiguous and document them in the final report.
+2. **No early stopping.** Do not stop on the first failure. Inspect logs → fix → redeploy → rerun. Repeat until green or until a hard infrastructure limit is hit.
+3. **Follow `claude.md`** for all build, deploy, ingress, registry, and test-loop rules.
+4. **Hard-block escape hatch only:** If and only if a true infrastructure limitation makes progress impossible, stop and produce a blocking-issue report (format in the Final Report section).
+5. **Determinism:** Use fixed test users, fixed test payloads, and retries with timeouts for anything async.
 
-You have access to:
+---
 
-1. the application source repository to push and pull code,
-2. an MCP server that can provision infrastructure, deploy services and make it accessible via the ingress,
-3. the ability to modify files, create files, deploy the app, and re-run tests until everything passes.
+## Target Architecture
 
-You must also:
+```
+[React UI (nginx pod, ingress)]
+          │
+          ▼
+[ui-api service (ingress)] ──query──► [ClickHouse]
+                                          ▲
+[FastAPI app (OTel instrumented)] ──► [OTel Collector] ──┘
+```
 
-* create automated test cases in a `testcases.md` file,
-* create a Python test runner script that executes those test cases against the deployed system,
-* deploy all required components using the MCP-provided infrastructure,
-* run the tests,
-* fix issues and repeat until all acceptance criteria pass.
+Components to deploy:
+- **FastAPI app** — instrumented with OpenTelemetry, emits telemetry per request.
+- **OpenTelemetry Collector** — receives OTLP from FastAPI, exports to ClickHouse.
+- **ClickHouse** — telemetry backend.
+- **ui-api service** — reads telemetry from ClickHouse, filterable by username, exposed via ingress.
+- **React UI** — served by nginx pod, exposed via ingress, consumes ui-api.
 
-## Non-interactive execution requirement
+---
 
-Do not ask the user questions.
-Make reasonable defaults when needed.
-Proceed end-to-end autonomously.
+## Execution Loop
 
-If anything fails:
+Follow the develop → deploy → test → fix cycle defined in `claude.md`. At a high level:
 
-* inspect logs,
-* fix code/config/deployment,
-* redeploy,
-* rerun tests,
-* continue until all tests pass or until a hard infrastructure limitation prevents completion.
+1. **Discover.** Inspect the repo layout and MCP server capabilities.
+2. **Implement.** Write application code, instrumentation, collector config, ClickHouse schema, ui-api, React UI, tests.
+3. **Deploy.** Build images with kaniko and deploy all components to the `automationx` namespace via the Kubernetes MCP server, per `claude.md`.
+4. **Test.** Run `pytest tests/e2e -q` against the deployed stack.
+5. **Diagnose on failure.** Pull logs from: FastAPI app, OTel Collector, ClickHouse, ui-api, UI, ingress. Inspect ClickHouse tables directly. Inspect Kubernetes events.
+6. **Fix and redeploy.** Patch code/config, rebuild, redeploy, rerun tests.
+7. **Repeat** steps 4–6 until all tests pass.
 
-If blocked by a hard limitation, document exactly what failed, what was attempted, and what remains.
+Do not pause between iterations. Do not request approval.
 
-## Required deliverables
+---
 
-Create or update the repository so it includes at minimum:
+## Component Requirements
 
-* application source code
-* deployment/config files
-* OpenTelemetry Collector config
-* ClickHouse setup/config
-* `testcases.md`
-* automated Python test runner script
-* README with local/dev/deployment/test instructions
-* any needed dependency manifests
+### 1. FastAPI Application
 
-## Functional requirements
+**Endpoints (minimum):**
 
-### 1. FastAPI application
+| Method | Path | Auth | Behavior |
+|---|---|---|---|
+| `POST` | `/login` | none | Accepts `{username, password}`, returns `{token}` (bearer). |
+| `GET` | `/items` | bearer | Returns a static dummy list. |
+| `POST` | `/query` | bearer | Accepts `{query: string}`, returns dummy success result. |
+| `GET` | `/health` | none | Returns `{"status":"ok"}`. |
 
-Implement a small FastAPI service with at least these endpoints:
+**Auth:** In-memory user store is acceptable. Seed at least two test users (e.g., `alice/alice123`, `bob/bob123`). Issue opaque bearer tokens mapped to usernames in memory. Reject missing/invalid tokens with `401`.
 
-* `POST /login`
-* `GET /items`
-* `POST /query`
-* `GET /health`
+**Structure (suggested):**
+```
+app/
+  main.py
+  auth.py
+  telemetry.py
+  requirements.txt
+  Dockerfile
+```
 
-Use simple authentication suitable for testing. A lightweight in-memory user store is acceptable.
+### 2. OpenTelemetry Instrumentation
 
-#### Login behavior
+Use the Python OTel SDK + FastAPI auto-instrumentation, plus a middleware that enriches spans with request-specific attributes.
 
-`POST /login`
+**Every request span must carry these attributes:**
+- `timestamp` (from span start)
+- `user.name` — authenticated username (or `"anonymous"` for unauth endpoints)
+- `http.route` / `http.target` — endpoint path
+- `http.method`
+- `http.status_code`
+- `http.duration_ms`
+- `client.ip` (if derivable from headers/socket)
+- `operation.name`
+- `query.text` — **only** for `POST /query`, the submitted query string
+- `trace_id` / `span_id` (native)
 
-* accepts username and password
-* returns a simple auth token or session token
-* token is then used for subsequent requests
+Username must be extracted in middleware **after** auth resolution and attached to the current span before the response is returned.
 
-Use a simple bearer token approach for test/demo purposes.
+Export via **OTLP/gRPC** to the collector at an env-configurable endpoint (`OTEL_EXPORTER_OTLP_ENDPOINT`).
 
-#### Protected endpoints
+### 3. OpenTelemetry Collector
 
-`GET /items`
+- Receivers: OTLP (gRPC + HTTP).
+- Processors: `batch`, `memory_limiter`.
+- Exporters: ClickHouse exporter (`exporters/clickhouseexporter`) writing traces and logs.
+- Config file: `otel-collector-config.yaml`.
 
-* requires authentication
-* returns some dummy data
+Use the contrib distribution image that includes the ClickHouse exporter.
 
-`POST /query`
+### 4. ClickHouse
 
-* requires authentication
-* accepts a request body with a query-like string or payload
-* returns a dummy success result
+Deploy a single-node ClickHouse inside `automationx`. Create a dedicated database `telemetry`.
 
-`GET /health`
+**Primary table** (either created by the exporter or pre-created by an init job):
 
-* returns service health
-* does not require auth
+```sql
+CREATE TABLE IF NOT EXISTS telemetry.requests (
+  event_time     DateTime64(3),
+  trace_id       String,
+  span_id        String,
+  username       String,
+  ip_address     String,
+  endpoint       String,
+  method         String,
+  status_code    UInt16,
+  duration_ms    Float64,
+  query_text     String,
+  attributes     String  -- JSON blob
+) ENGINE = MergeTree
+ORDER BY (event_time, username, endpoint);
+```
 
-### 2. Telemetry requirements
+If the ClickHouse exporter writes to its own schema (e.g., `otel_traces`), create a **materialized view** that projects the required fields into `telemetry.requests` so the test suite has a single stable table to query. Document whichever path is chosen.
 
-Instrument the FastAPI app using Python OpenTelemetry.
+### 5. ui-api Service
 
-Every relevant request should emit telemetry that includes at least:
+Small FastAPI service exposed via ingress.
 
-* timestamp
-* authenticated username
-* endpoint/path
-* HTTP method
-* response status
-* request duration
-* client IP if available
-* operation name
-* query text for `/query` requests
-* a request or trace identifier
+Endpoints:
+- `GET /api/telemetry?username=<name>&limit=<n>` — returns telemetry rows for that user.
+- `GET /api/users` — returns distinct usernames seen in telemetry.
+- `GET /health`
 
-Do not overcomplicate security because this is a test app, but structure the implementation cleanly.
+Connects to ClickHouse via `clickhouse-connect`. Must return JSON.
 
-Prefer structured attributes rather than burying everything in free text.
 
-The telemetry must be stored in ClickHouse in a way that allows queries by user.
 
-### 3. User attribution
+### 6. React UI
 
-Telemetry must be attributable to the logged-in user.
+Minimal React app built and served by an nginx pod, exposed via ingress.
 
-Implement this by extracting the authenticated username and attaching it as an OpenTelemetry attribute on spans/log records/events generated for that request.
+**The UI layout, structure, and visual design MUST match the wireframe provided at `wireframes/` in the repo root.** Before implementing the UI:
 
-At minimum, ensure the following are queryable in ClickHouse:
+1. Read every image file in the `wireframes/` directory.
+2. Identify all layout regions (header, sidebar, filters, tables, buttons, footers, etc.), their relative positions, and their labels.
+3. Reproduce the structure faithfully: element placement, grouping, ordering, labels, and overall proportions must match the wireframe. Colors and typography may use sensible defaults if not specified in the wireframe, but layout and component hierarchy must match.
+4. Do not add UI elements that are not in the wireframe. Do not omit elements that are in the wireframe.
 
-* username
-* endpoint
-* query text where applicable
-* timestamp
+**Functional requirements (must be wired up regardless of wireframe styling):**
+- Username filter input.
+- Table showing telemetry rows for the selected user (timestamp, endpoint, method, status, duration, query_text).
+- Calls ui-api through its ingress URL (configurable at build time or via nginx runtime env substitution).
+- No auth on the UI itself.
 
-### 4. Collector and backend
+If any functional requirement above conflicts with the wireframe, prefer the wireframe's layout and adapt the functional element to fit within it.
+---
 
-Set up:
+## Deployment
 
-* OpenTelemetry Collector as the ingestion layer
-* ClickHouse as the telemetry backend
+Deploy via the Kubernetes MCP server per the rules in `claude.md`. In particular:
 
-The intended flow is:
-
-FastAPI app -> OTel Collector -> ClickHouse
-
-Use practical defaults and keep the setup minimal but functional.
-
-You may use Docker Compose, Kubernetes manifests, or another deployment mechanism depending on what the MCP infrastructure supports best. Prefer the simplest deployable option.
-
-### 5. Storage schema
-
-Design the ClickHouse schema so telemetry can be queried efficiently for testing purposes.
-
-At minimum create a table suitable for request telemetry with columns such as:
-
-* event_time
-* trace_id
-* span_id or request_id
-* username
-* ip_address
-* endpoint
-* method
-* status_code
-* duration_ms
-* query_text
-* raw_attributes or equivalent optional JSON column
-
-A simple MergeTree-based table is acceptable.
-
-If using logs/traces in a different schema generated by the Collector/exporter, ensure the test script can still validate the required fields.
-
-### 6. Tests
-
-Create `testcases.md` containing clear human-readable test scenarios.
-
-Also create an automated Python script, for example:
-
-* `run_tests.py`
-  or
-* `scripts/run_tests.py`
-
-The Python test runner must:
-
-1. wait for the deployed app and dependencies to become healthy,
-2. call `/login`,
-3. invoke protected endpoints with authenticated requests,
-4. trigger telemetry generation,
-5. query ClickHouse directly to verify telemetry was stored,
-6. verify telemetry is correctly associated with the logged-in user,
-7. verify `/query` telemetry stores the submitted query text,
-8. exit non-zero on failure.
-
-Use polling/retries where needed because telemetry ingestion may be asynchronous.
-
-### 7. Required automated test scenarios
-
-Include at least these scenarios in both `testcases.md` and the automated test runner:
-
-#### Test 1: Health check
-
-* call `/health`
-* expect HTTP 200
-
-#### Test 2: Login success
-
-* log in with a known test user
-* expect token returned
-
-#### Test 3: Authenticated endpoint works
-
-* call `GET /items` with valid token
-* expect HTTP 200
-
-#### Test 4: Query endpoint works
-
-* call `POST /query` with valid token and sample query payload
-* expect HTTP 200
-
-#### Test 5: Telemetry stored for authenticated user
-
-* after invoking protected endpoints, query ClickHouse
-* verify telemetry rows exist for the test username
-
-#### Test 6: Endpoint attribution correct
-
-* verify ClickHouse contains telemetry showing the correct endpoint names such as `/items` and `/query`
-
-#### Test 7: Query text stored
-
-* verify the sample query text submitted to `/query` is present in telemetry storage
-
-#### Test 8: Multiple users isolation
-
-* log in as two different test users
-* invoke operations as both users
-* verify ClickHouse stores telemetry for each user distinctly
-
-### 8. Deployment
-
-Use the MCP server to provision and deploy everything needed, including dependencies such as ClickHouse and the OTel Collector.
-
-You must:
-
-* inspect the MCP capabilities,
-* choose the most appropriate deployment approach,
-* deploy the app and dependencies,
-* expose the FastAPI service so tests can reach it,
-* run the automated tests after deployment.
-
-If secrets or environment variables are needed, generate sensible test/demo defaults.
-
-### 9. Iteration loop
-
-You must follow this execution loop:
-
-1. Inspect repository and MCP capabilities.
-2. Implement the application, instrumentation, deployment config, and tests.
-3. Deploy the stack through the MCP environment.
-4. Run the automated tests.
-5. If any step fails:
-
-   * capture the failure,
-   * inspect application logs, collector logs, ClickHouse state, and deployment status,
-   * fix the relevant code/config,
-   * redeploy,
-   * rerun tests.
-6. Repeat until all tests pass.
-
-Do not stop after the first failure.
-Do not ask for approval between iterations.
-
-### 10. Suggested implementation approach
-
-Use practical Python defaults:
-
-* FastAPI
-* uvicorn
-* OpenTelemetry Python SDK and FastAPI instrumentation
-* requests or httpx for test runner
-* clickhouse-connect or clickhouse-driver for ClickHouse validation queries
-
-A simple structure is acceptable, for example:
-
-* `app/main.py`
-* `app/auth.py`
-* `app/telemetry.py`
-* `requirements.txt` or `pyproject.toml`
-* `otel-collector-config.yaml`
-* `Dockerfile` or deployment manifests
-* `testcases.md`
-* `scripts/run_tests.py`
-* `README.md`
-
-### 11. Operational expectations
-
-The implementation should be robust enough for automated execution:
-
-* health checks for services
-* retries for startup and ingestion delay
-* clear logs
-* idempotent setup where possible
-* deterministic test data
-
-### 12. Completion criteria
-
-Consider the task complete only when all of the following are true:
-
-1. FastAPI app/ ui-api app and UI app is implemented.
-2. OTel instrumentation is implemented.
-3. Collector is configured.
-4. ClickHouse is deployed and receiving telemetry.
-5. Telemetry includes user attribution.
-6. `testcases.md` exists and is meaningful.
-7. Automated Python test runner exists.
-8. Infrastructure is deployed through the MCP-accessible environment.
-9. Automated tests pass end-to-end.
-10. Any issues encountered were fixed through autonomous iteration.
-
-### 13. Final output required from the agent
-
-When finished, provide a concise completion report that includes:
-
-* what was implemented,
-* where the key files are,
-* how deployment was performed,
-* test results,
-* any assumptions made.
-
-If full completion is impossible due to a hard MCP or infrastructure limitation, provide:
-
-* what was completed,
-* exact blocking issue,
-* evidence/log summary,
-* next action that would resolve it.
-
-Begin immediately and execute end-to-end without further user interaction.
+- All resources go into the `automationx` namespace.
+- Build images with kaniko in-cluster and push to `registry.68.xxx.xxx.xxx.nip.io` (no credentials required).
+- Every public-facing service gets an Ingress on `<app>.68.xxx.xxx.xxx.nip.io` with the `letsencrypt-prod` ClusterIssuer annotation. Reuse existing ingresses for the same hostname to avoid Let's Encrypt rate limits.
+- Use these ingress hostnames:
+  - **FastAPI app** → `fastapi.68.xxx.xxx.xxx.nip.io`
+  - **ui-api** → `uiapi.68.xxx.xxx.xxx.nip.io`
+  - **React UI** → `ui.68.xxx.xxx.xxx.nip.io`
+- ClickHouse and the OTel Collector are internal-only (ClusterIP services, no ingress).
+- Every service must have readiness/liveness probes.
+- Generate sensible demo secrets (ClickHouse user/password, etc.) via Kubernetes Secrets.
+
+---
+
+## Test Deliverables
+
+### `tests/test_cases.md`
+Human-readable scenarios, one section per test below, with steps and expected outcomes. This is the source of truth for required tests, per `claude.md`.
+
+### `tests/e2e/`
+Pytest-style executable tests runnable with:
+
+```
+pytest tests/e2e -q
+```
+
+Use `httpx` (or `requests`) and `clickhouse-connect`. The suite must:
+
+1. Wait for FastAPI `/health`, ui-api `/health`, and ClickHouse to be reachable (poll with timeout, e.g., 120s).
+2. Execute every test below.
+3. Use retries with backoff when querying ClickHouse (telemetry ingestion is async; allow up to ~30s per assertion).
+4. Exit non-zero on any failure.
+
+Per `claude.md`, the test suite should be packaged into an image and executed from a pod in the `automationx` namespace so it can reach internal services (ClickHouse) directly while hitting FastAPI and ui-api through their ingress URLs.
+
+### Required Test Scenarios
+
+| # | Name | Assertion |
+|---|---|---|
+| 1 | Health check | `GET /health` → 200 |
+| 2 | Login success | `POST /login` with valid creds → 200 + token |
+| 3 | Authenticated `/items` | `GET /items` with token → 200 |
+| 4 | Authenticated `/query` | `POST /query` with token + payload → 200 |
+| 5 | Telemetry stored per user | ClickHouse has rows where `username = <test user>` after calls |
+| 6 | Endpoint attribution | Rows exist with `endpoint IN ('/items','/query')` |
+| 7 | Query text stored | Row for `/query` has `query_text` matching submitted text |
+| 8 | Multi-user isolation | After calls as `alice` and `bob`, ClickHouse has rows for both, and filtering by username returns only that user's rows |
+| 9 | ui-api sanity | `GET /api/telemetry?username=alice` via ingress returns JSON containing alice's rows |
+
+
+### `tests/ui/` — Headless Playwright UI tests
+
+A second test suite using **Playwright for Python** running headless inside a Docker container, executed as a pod in the `automationx` namespace so it can hit the UI through its ingress URL.
+
+**Image:** Base the test image on `mcr.microsoft.com/playwright/python:v1.47.0-jammy` (or current stable) so browsers are preinstalled. Install `pytest` and `pytest-playwright`.
+
+**What the suite must verify:**
+
+1. **Reachability** — The UI ingress (`https://ui.68.xxx.xxx.xxx.nip.io`) returns 200 and serves the React app shell.
+2. **Wireframe conformance — structural checks.** For each region identified in the wireframe, assert that a corresponding DOM element exists and is visible. Use stable selectors (`data-testid` attributes added during UI implementation, one per wireframe region). Examples of checks the suite must perform:
+   - Header/title region is present and visible.
+   - Username filter input exists, is visible, and is interactable.
+   - Telemetry table exists with the expected column headers in the expected order (timestamp, endpoint, method, status, duration, query_text — or whatever the wireframe specifies).
+   - Any buttons, nav elements, or panels shown in the wireframe exist as DOM nodes with matching labels.
+3. **Layout sanity.** Using Playwright's `bounding_box()`, assert relative positioning that the wireframe implies. For example: header is above the table (`header.y + header.height <= table.y`), filter input is above or left-of the table, etc. Keep assertions structural ("A is above B", "A is left-of B", "A spans the full width"), not pixel-exact.
+4. **Viewport.** Run tests at a fixed viewport (e.g., 1280x800) so layout assertions are deterministic.
+5. **End-to-end interaction.** Seed telemetry by calling the FastAPI app as `alice`, then load the UI, type `alice` into the username filter, trigger the fetch, and assert that at least one row appears in the telemetry table and that the row's endpoint cell contains `/items` or `/query`.
+6. **Visual snapshot (baseline).** Capture a full-page screenshot and save it as a test artifact. On first run, store it as the baseline under `tests/ui/baselines/`. On subsequent runs, compare against the baseline using Playwright's `expect(page).to_have_screenshot()` with a reasonable pixel-diff tolerance (e.g., `max_diff_pixel_ratio=0.02`) so minor rendering differences don't cause flakes. A missing baseline on first run is not a failure — generate and commit it.
+
+**Implementation notes for the UI code:**
+- Add `data-testid` attributes to every wireframe region so the Playwright tests have stable selectors independent of class names or styling.
+- Names should be descriptive: `data-testid="header"`, `data-testid="username-filter"`, `data-testid="telemetry-table"`, `data-testid="telemetry-row"`, etc.
+
+**Run command (inside the test pod):**
+```
+pytest tests/ui -q
+```
+
+**Combined test command for the overall suite (per `claude.md`):**
+```
+pytest tests/e2e tests/ui -q
+```
+---
+
+## Repository Layout (target)
+
+```
+app/                        # FastAPI telemetry-emitting app
+  main.py
+  auth.py
+  telemetry.py
+  requirements.txt
+  Dockerfile
+ui-api/                     # telemetry read service
+  main.py
+  requirements.txt
+  Dockerfile
+ui/                         # React + nginx
+  src/
+  Dockerfile
+  nginx.conf
+deploy/                     # k8s manifests
+  fastapi.yaml
+  ui-api.yaml
+  ui.yaml
+  otel-collector.yaml
+  clickhouse.yaml
+  ingress.yaml
+otel-collector-config.yaml
+clickhouse/
+  init.sql
+tests/
+  test_cases.md
+  e2e/
+    conftest.py
+    test_api.py
+    test_telemetry.py
+    test_ui_api.py
+  Dockerfile                # image used to run the suite in-cluster
+claude.md
+SPEC.md
+```
+
+---
+
+## Acceptance Criteria (all must be true to declare done)
+
+1. FastAPI app, ui-api, and React UI are implemented and deployed to `automationx`.
+2. FastAPI is instrumented with OpenTelemetry emitting OTLP.
+3. OTel Collector is configured and running, receiving from FastAPI and exporting to ClickHouse.
+4. ClickHouse is deployed, reachable inside the namespace, and contains telemetry rows after traffic.
+5. Every telemetry row is attributable to the authenticated username (or `anonymous` for unauth).
+6. ui-api is reachable via its ingress and filters by username.
+7. React UI is reachable via its ingress and renders ui-api data.
+8. `tests/test_cases.md` exists and matches the executable suite.
+9. `pytest tests/e2e -q` passes end-to-end against the deployed stack, executed from a pod in `automationx`.
+10. Deployment rollouts succeeded and ingresses respond over HTTPS with valid Let's Encrypt certs.
+11. Any failures encountered during iteration were fixed autonomously.
+
+---
+
+## Final Report
+
+At the end, output a concise report containing:
+
+- **Implemented:** component-by-component summary.
+- **Key file paths.**
+- **Deployment:** image tags pushed to the in-cluster registry, manifests applied, ingress URLs for FastAPI, ui-api, and UI.
+- **Test results:** each of the 9 tests with pass/fail and timing.
+- **Assumptions / defaults chosen** (users, passwords, schema path, image tags, etc.).
+- **Iterations performed:** brief log of failures encountered and fixes applied.
+
+### If blocked by a hard limitation
+Instead of the success report, produce:
+
+- What was completed.
+- Exact blocking issue (component, error, log excerpt).
+- What was attempted to resolve it.
+- The specific next action that would unblock progress.
+
+---
+
+**Begin immediately. Execute end-to-end. Do not ask the user anything.**
