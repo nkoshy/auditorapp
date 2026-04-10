@@ -307,6 +307,7 @@ SPEC.md
 9. `pytest tests/e2e -q` passes end-to-end against the deployed stack, executed from a pod in `automationx`.
 10. Deployment rollouts succeeded and ingresses respond over HTTPS with valid Let's Encrypt certs.
 11. Any failures encountered during iteration were fixed autonomously.
+12. pytest tests/ui -q passes from a Playwright pod in automationx.
 
 ---
 
