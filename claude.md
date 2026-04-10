@@ -18,7 +18,7 @@ Use these commands as the default workflow:
 2. You can use kaniko to build the docker image and push it to docker hub, my docker hub user name is nkoshy, kaniko job should use the same namespace and the completed jobs to be deleted.
 2. Wait for rollout to complete
 3. Ensure ingress is available at:
-   https://<appname>.68.220.202.177.nip.io
+   https://'<appname>'.68.220.202.177.nip.io
 4. You can use the annotation on the ingress resource to get letsencrypt certificate automatically. The Cluster Issuer to use is letsencrypt-prod
 4. Run the required test suite, you can build an image with test suite files and execute it from the container in the same namespace
 5. If any test fails:
